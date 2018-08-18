@@ -1,0 +1,219 @@
+---
+title: "Quick Prior-based Lung Segmentation from CT"
+author: "Brian B. Avants et al."
+date: "8/16/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set( echo = TRUE )
+knitr::opts_chunk$set( cache = FALSE )
+library( ANTsR )
+setwd( "~/code/QLS/src/" )
+```
+
+# Setup for problem
+
+Use ANTsR and some prior knowledge about tissue statistics in CT.
+
+```{r lungSetup}
+library( ANTsR )
+centers = c( 
+  lung   = -821, # prior mean for lung
+  label2 = -95, 
+  label3 = 67, 
+  label4 = 296, 
+  label5 = 863 ) 
+```
+
+# TCIA data
+
+We employ example data from the TCIA public set.
+
+```{r readlungs,echo=FALSE,include=TRUE,message=FALSE,warning=FALSE}
+doplot = T
+fn="../data/AMC-001-EX.nii.gz"
+fn="../data/tcga_QQ_A5V2_chesttopelvis.nii.gz"
+img = antsImageRead( fn )
+if ( doplot ) {
+#  plot( img, axis=1, slice = 270 )
+  invisible( plot( img, axis=2, slice = 270 ) )
+}
+invisible( gc() )
+print( fn )
+#####
+```
+
+# Segmenting body from background
+
+Take advantage of CT tissue quantification to extract body from background.
+
+This approach may be fairly fragile (due to selection of erosion value and specific threshold values) but should be relatively easy to robustify and/or automate selection of best solution.
+
+```{r segBody}
+######################################
+segBody = thresholdImage( img, centers[1], Inf ) %>% 
+  morphology( "erode", 5 ) %>%
+  iMath( "GetLargestComponent" ) %>% 
+  morphology( "close", 25 ) %>% 
+  iMath( "FillHoles" )
+```
+
+```{r ,echo=FALSE,include=FALSE,message=FALSE,warning=FALSE}
+invisible( gc() )
+```
+
+# Segmenting tissues and lung
+
+Within the body mask, segment the tissues by k-means using the previously defined centers.
+
+We choose the CT-based centers ( mean values ) to initialize the k-means consistently across subjects.
+
+Results may vary some across runs but are overall consistent enough.
+
+```{r segTissue}
+invisible( gc() )
+fastKMeans <- function(  img, mask, k, verbose = FALSE ) {
+  km = kmeans( as.numeric( img[ mask == 1 ] ), centers = k  )
+  if ( verbose )  print( km$centers )
+  km = makeImage(  mask,  km[[1]] )
+  return( km )
+}
+####
+seg = fastKMeans( img, segBody, k = centers, verbose = TRUE )
+invisible( gc() )
+#
+```
+
+
+
+# Label the lung
+
+The first center selected above is generally the lung - we could get crazier 
+ later on but this makes the point.  Need to see if this fails by running on 
+ larger datasets.
+
+```{r segLung,echo=FALSE}
+lung = thresholdImage( seg, 1, 1 ) %>% iMath("GetLargestComponent" ) 
+invisible( gc() )
+vess =  morphology( lung, "close", 5 ) - lung
+invisible( gc() )
+````
+
+
+
+```{r segLungExpt,echo=FALSE,eval=FALSE}
+# potentially useful experiments below ....
+if ( FALSE ) {
+# get rid of 2 biggest components ( background )
+for ( ww in 1:2 ) {
+  invisible( gc() )
+  glarge = thresholdImage( seg, 1 , 1 ) %>%
+    iMath( "GetLargestComponent" )
+  invisible( gc() )
+  seg[ glarge == 1 ] = 0
+  invisible( gc() )
+  }
+invisible( gc() )
+lungs = thresholdImage( seg, 1, 1 ) %>%
+  morphology( "erode", 4, type = 'binary')
+invisible( gc() )
+lungs = labelClusters( lungs, 5000, fullyConnected=TRUE ) %>%
+  morphology( "dilate", 4, type = 'grayscale' )
+#  iMath( "PadImage", padva )
+invisible( gc() )
+mystats = labelStats( lungs, lungs )
+invisible( gc() )
+antsImageWrite( lungs, paste0( "/tmp/lungs", basename( fn ) ))
+############################################
+3632343
+2514180
+mystatskeep = mystats$Volume < 3832343 &
+              mystats$Volume > 553094.625
+mystatskeep = mystats$LabelValue[ mystatskeep ]
+lungsX = maskImage( lungs, lungs, level = mystatskeep )
+antsImageWrite( lungs, paste0( "/tmp/lungs", basename( fn ) ))
+}
+############################################
+```
+
+# Split left and right
+
+We erode and label the components, throwing away small regions.  This eventually gives us two big components which are probably the left and right lung labels.
+
+```{r split}
+myval = 0
+mye=0
+# this assumes spacing is in millimeters
+minLungSize = 0.5e6/prod( antsGetSpacing( lung ) ) # based on 0.5 Liter min lung volume
+lungCrop = cropImage( lung, lung  )
+while ( myval < 2 ) {
+  mye = mye + 1
+  temp = morphology( lungCrop, "erode", mye ) %>% labelClusters( minLungSize )
+  myval = max( temp )
+  invisible( gc() ) # force garbage collection to limit memory use
+  print( myval )
+  }
+finalLungs = morphology( temp, "dilate", mye, type = "grayscale"  ) %>%
+  decropImage( img )
+antsImageWrite( finalLungs, paste0( "/tmp/lungs", basename( fn ) ))
+antsImageWrite( vess, paste0( "/tmp/vess", basename( fn ) ))
+```
+
+The above process may also isolate the trachea - though i have not looked closely into this.
+
+
+```{r symm,echo=FALSE,eval=FALSE}
+############################
+if ( ! exists( "smallImage" ) ) {
+  negi = -(img * morphology( lung, "dilate", 15 ) )
+  smallImage = resampleImage( negi, 8 )
+  antsImageWrite( smallImage, '/tmp/imgs.nii.gz'  )
+  }
+imgr = reflectImage( smallImage, axis = 0 )
+symm = buildTemplate( smallImage, list( smallImage, imgr ), 
+  iterations = 3, typeofTransform='SyN',
+  affIterations=c(0),
+  regIterations=c(40,0),
+  affSampling=12,
+  totalSigma = 3.5,
+  synMetric='CC', synSampling=2, verbose=FALSE )
+symmLR = symm * 0 + 1
+symmLR[ 1:round(dim(symmLR)[1]/2), 1:round(dim(symmLR)[2]), 1:round(dim(symmLR)[3]) ] = 2
+symmToOrig = antsRegistration( smallImage, symm, 'SyN' )
+origLR = antsApplyTransforms( img, symmLR, 
+  transformlist = symmToOrig$fwdtransforms, interpolator = 'nearestNeighbor' )
+antsImageWrite( origLR, '/tmp/imgLR.nii.gz'  )
+invisible( gc() )
+```
+
+# Value of the result: We isolated the chest in the image
+
+The labeled lung ...
+
+```{r vizl,echo=FALSE}
+invisible( gc() )
+sl = 120
+left = thresholdImage( finalLungs, 1, Inf )
+temp = cropImage( img, lung * left )
+invisible( plot( temp, finalLungs, color.overlay=c('jet'), axis=2, slice = sl ) )
+invisible( gc() )
+```
+
+The labeled vasculature ...
+
+```{r vizv,echo=FALSE}
+invisible( gc() )
+invisible( plot( temp, vess, color.overlay='yellow', axis=2, slice = sl ) )
+invisible( gc() )
+```
+
+Something similar will likely work with X-ray, though perhaps not as well.
+
+
+We can use the labeled lungs as initialization for cropping and orienting body CT images.
+
+They also serve as a chest-oriented coordinate system where we know the heart is centered between left and right and that the liver is inferior to the right lung.
+
+This is also useful for cropping, initializing registration and, ultimately, for segmentation.
+
